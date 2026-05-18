@@ -64,13 +64,13 @@ _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
 _DIFF_JUDGE_MODEL = "openai/gpt-5.4"
-_DIFF_JUDGE_WEIGHT = 0.5
+_DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"effort": "medium", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
-_DIFF_JUDGE_ATTEMPTS = 2
+_DIFF_JUDGE_ATTEMPTS = 4
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
@@ -1416,8 +1416,7 @@ def _neutral_diff_judge(reason: str | None = None) -> DiffJudgeResult:
 
 
 def _combined_round_score(cursor_similarity: float, llm_score: float) -> float:
-    cursor_weight = 1.0 - _DIFF_JUDGE_WEIGHT
-    return cursor_weight * _clamp01(cursor_similarity) + _DIFF_JUDGE_WEIGHT * _clamp01(llm_score)
+    return _clamp01(llm_score)
 
 
 def _round_winner_from_scores(king_score: float, challenger_score: float) -> str:
@@ -2336,19 +2335,24 @@ def _pool_filler_loop(
                     pool=pool,
                     king=current_king,
                 )
+                candidate = PoolTask(
+                    task_name=task_name,
+                    task_root=task_root,
+                    creation_block=creation_block,
+                    cursor_elapsed=baseline_elapsed,
+                    king_lines=king_compare.matched_changed_lines,
+                    king_similarity=king_compare.similarity_ratio,
+                    baseline_lines=king_compare.total_changed_lines_b,
+                    agent_timeout_seconds=agent_timeout,
+                    king_hotkey=current_king.hotkey,
+                    king_commit_sha=current_king.commit_sha,
+                )
+                healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=candidate)
+                if not healthy:
+                    log.info("Pool filler[%s]: skipping %s (%s)", pool_label, task_name, reason)
+                    continue
                 pruned = pool.add(
-                    PoolTask(
-                        task_name=task_name,
-                        task_root=task_root,
-                        creation_block=creation_block,
-                        cursor_elapsed=baseline_elapsed,
-                        king_lines=king_compare.matched_changed_lines,
-                        king_similarity=king_compare.similarity_ratio,
-                        baseline_lines=king_compare.total_changed_lines_b,
-                        agent_timeout_seconds=agent_timeout,
-                        king_hotkey=current_king.hotkey,
-                        king_commit_sha=current_king.commit_sha,
-                    ),
+                    candidate,
                     keep=config.validate_task_pool_target,
                     prune_first=prune_first,
                     preserve=_active_duel_task_names(state),
@@ -2834,7 +2838,7 @@ def _refresh_pool_task_for_king(
         log.info("Pool refresh[%s]: dropping %s (baseline produced no patch)", pool_label, task_name)
         return None
 
-    return PoolTask(
+    refreshed = PoolTask(
         task_name=task.task_name,
         task_root=task.task_root,
         creation_block=task.creation_block,
@@ -2846,6 +2850,11 @@ def _refresh_pool_task_for_king(
         king_hotkey=king.hotkey,
         king_commit_sha=king.commit_sha,
     )
+    healthy, reason = _pool_task_has_healthy_king_cache(config=config, task=refreshed)
+    if not healthy:
+        log.info("Pool refresh[%s]: dropping %s (%s)", pool_label, task_name, reason)
+        return None
+    return refreshed
 
 
 def _refresh_pool_for_king(
@@ -3726,9 +3735,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     _setup_logging(debug=config.debug)
     _kill_stale_containers()
     log.info(
-        "Scoring: %d rounds per duel, round score is %.0f%% Cursor similarity + %.0f%% LLM diff judge (%s), ties ignored, challenger must beat king by >%d decisive round(s)",
+        "Scoring: %d rounds per duel, round score is %.0f%% LLM diff judge (%s); Cursor similarity is telemetry only, ties ignored, challenger must beat king by >%d decisive round(s)",
         config.validate_duel_rounds,
-        (1.0 - _DIFF_JUDGE_WEIGHT) * 100,
         _DIFF_JUDGE_WEIGHT * 100,
         _DIFF_JUDGE_MODEL,
         config.validate_win_margin,
@@ -4845,7 +4853,7 @@ def _publish_dashboard(
             "llm_diff_judge_weight": _DIFF_JUDGE_WEIGHT,
             "llm_diff_judge_model": _DIFF_JUDGE_MODEL,
             "ties_count": False,
-            "description": "Round score is 1/2 Cursor similarity plus 1/2 LLM diff judgment; challenger must win more decisive rounds than the king plus margin (ties ignored)",
+            "description": "Round score is based only on the LLM diff judgment; Cursor similarity is retained as telemetry and for pool operations. Challenger must win more decisive rounds than the king plus margin (ties ignored)",
         },
         "queue": [
             {
@@ -4875,6 +4883,8 @@ def _publish_dashboard(
                 history=history,
                 share=1.0 / max(1, config.validate_king_window_size),
                 king_since=_recent_king_since(k, state=state, history=history),
+                king_duels_defended=_recent_king_defense_count(k, history=history),
+                hold_seconds=_recent_king_hold_seconds(k, state=state, history=history),
             )
             for k in _effective_recent_kings(state)
         ],
@@ -4898,6 +4908,8 @@ def _dashboard_submission_dict(
     history: list[dict[str, Any]] | None = None,
     share: float | None = None,
     king_since: str | None = None,
+    king_duels_defended: int | None = None,
+    hold_seconds: int | None = None,
 ) -> dict[str, Any]:
     display_repo = _dashboard_display_submission_repo_name(submission)
     display_commit = submission.display_commit_sha or submission.commit_sha
@@ -4945,6 +4957,10 @@ def _dashboard_submission_dict(
         payload["share"] = share
     if king_since is not None:
         payload["king_since"] = king_since
+    if king_duels_defended is not None:
+        payload["king_duels_defended"] = king_duels_defended
+    if hold_seconds is not None:
+        payload["hold_seconds"] = hold_seconds
     return payload
 
 
@@ -5026,6 +5042,128 @@ def _current_king_defense_count(
             continue
         defenses += 1
     return defenses
+
+
+def _recent_king_defense_count(
+    submission: ValidatorSubmission,
+    *,
+    history: list[dict[str, Any]],
+) -> int:
+    if not submission.hotkey:
+        return 0
+
+    ordered_duels = sorted(
+        (duel for duel in history if isinstance(duel, dict)),
+        key=lambda duel: _coerce_int(duel.get("duel_id")) or 0,
+    )
+    start_id = _latest_transition_duel_id(submission, ordered_duels)
+    end_id = _next_replacement_duel_id(submission, ordered_duels, after_duel_id=start_id)
+
+    defenses = 0
+    for duel in ordered_duels:
+        duel_id = _coerce_int(duel.get("duel_id")) or 0
+        if start_id is not None and duel_id <= start_id:
+            continue
+        if end_id is not None and duel_id >= end_id:
+            continue
+        if str(duel.get("king_hotkey") or "") != submission.hotkey:
+            continue
+        if duel.get("task_set_phase") == "confirmation_retest" or duel.get("confirmation_of_duel_id") is not None:
+            continue
+        if duel.get("king_replaced") is True:
+            continue
+        if duel.get("disqualification_reason"):
+            continue
+        defenses += 1
+    return defenses
+
+
+def _recent_king_hold_seconds(
+    submission: ValidatorSubmission,
+    *,
+    state: ValidatorState,
+    history: list[dict[str, Any]],
+) -> int | None:
+    start = _recent_king_since(submission, state=state, history=history)
+    if not start:
+        return None
+
+    start_dt = _parse_github_timestamp(start)
+    if start_dt is None:
+        return None
+
+    end = None
+    if state.current_king is not None and _same_submission(submission, state.current_king):
+        end = _timestamp()
+    else:
+        ordered_duels = sorted(
+            (duel for duel in history if isinstance(duel, dict)),
+            key=lambda duel: _coerce_int(duel.get("duel_id")) or 0,
+        )
+        start_id = _latest_transition_duel_id(submission, ordered_duels)
+        end_id = _next_replacement_duel_id(submission, ordered_duels, after_duel_id=start_id)
+        if end_id is not None:
+            duels_by_id = {
+                int(duel["duel_id"]): duel
+                for duel in ordered_duels
+                if str(duel.get("duel_id", "")).isdigit()
+            }
+            end_duel = duels_by_id.get(end_id)
+            if end_duel is not None:
+                end = _confirmed_transition_timestamp(end_duel, duels_by_id)
+
+    end_dt = _parse_github_timestamp(end) if end else None
+    if end_dt is None:
+        return None
+    return max(0, int((end_dt - start_dt).total_seconds()))
+
+
+def _latest_transition_duel_id(submission: ValidatorSubmission, history: list[dict[str, Any]]) -> int | None:
+    latest = None
+    for duel in history:
+        if not _summary_transition_matches(duel, "challenger", submission):
+            continue
+        duel_id = _coerce_int(duel.get("duel_id"))
+        if duel_id is not None:
+            latest = duel_id
+    return latest
+
+
+def _next_replacement_duel_id(
+    submission: ValidatorSubmission,
+    history: list[dict[str, Any]],
+    *,
+    after_duel_id: int | None,
+) -> int | None:
+    for duel in history:
+        duel_id = _coerce_int(duel.get("duel_id"))
+        if duel_id is None:
+            continue
+        if after_duel_id is not None and duel_id <= after_duel_id:
+            continue
+        if _summary_transition_matches(duel, "king", submission):
+            return duel_id
+    return None
+
+
+def _summary_transition_matches(summary: dict[str, Any], prefix: str, submission: ValidatorSubmission) -> bool:
+    if not isinstance(summary, dict) or not summary.get("king_replaced"):
+        return False
+    if summary.get("task_set_phase") == "confirmation_retest" or summary.get("confirmation_of_duel_id") is not None:
+        return False
+    if summary.get("disqualification_reason"):
+        return False
+    for key in _summary_submission_keys(prefix):
+        participant = _duel_submission_from_payload(summary, key)
+        if participant is not None:
+            return _same_submission(participant, submission)
+    return _summary_participant_matches_submission(summary, prefix, submission)
+
+
+def _summary_submission_keys(prefix: str) -> tuple[str, ...]:
+    if prefix == "king":
+        return ("king", "king_before")
+    return (prefix,)
 
 
 def _find_winning_challenger_summary(
