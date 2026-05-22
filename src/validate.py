@@ -2459,7 +2459,7 @@ def _cached_solution_agent_timeout_seconds(
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
 
-_POOL_FILLER_WORKER_OVERSUBSCRIBE = 3
+_POOL_FILLER_WORKER_OVERSUBSCRIBE = 1
 
 
 def _pool_filler_worker_count(config: RunConfig) -> int:
@@ -3438,6 +3438,41 @@ def _gather_pool_tasks(
     return _order_duel_tasks_for_submission(tasks)
 
 
+def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]:
+    return {
+        "task_name": round_result.task_name,
+        "winner": round_result.winner,
+        "king_lines": round_result.king_lines,
+        "challenger_lines": round_result.challenger_lines,
+        "king_score": round_result.king_score,
+        "challenger_score": round_result.challenger_score,
+        "king_llm_score": round_result.king_llm_score,
+        "challenger_llm_score": round_result.challenger_llm_score,
+        "llm_judge_winner": round_result.llm_judge_winner,
+        "king_exit_reason": round_result.king_exit_reason,
+        "challenger_exit_reason": round_result.challenger_exit_reason,
+        "king_agent_timeout_seconds": round_result.king_agent_timeout_seconds,
+        "challenger_agent_timeout_seconds": round_result.challenger_agent_timeout_seconds,
+        "king_similarity_ratio": round_result.king_similarity_ratio,
+        "challenger_similarity_ratio": round_result.challenger_similarity_ratio,
+        "king_challenger_similarity": round_result.king_challenger_similarity,
+    }
+
+
+def _active_rounds_payload(
+    rounds: Sequence[ValidationRoundResult],
+    published_artifact_task_names: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    scored_payloads = [_active_round_payload(round_result) for round_result in rounds if round_result.scored]
+    scored_task_names = {str(item.get("task_name") or "") for item in scored_payloads}
+    pending_payloads = [
+        {"task_name": task_name, "winner": "pending", "artifact_published": True}
+        for task_name in published_artifact_task_names
+        if task_name and task_name not in scored_task_names
+    ]
+    return [*scored_payloads, *pending_payloads]
+
+
 def _solve_and_compare_round(
     *,
     task: PoolTask,
@@ -3446,6 +3481,7 @@ def _solve_and_compare_round(
     config: RunConfig,
     duel_id: int,
     pool: TaskPool | None = None,
+    on_artifacts_published: Any | None = None,
 ) -> ValidationRoundResult:
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
@@ -3572,7 +3608,7 @@ def _solve_and_compare_round(
         )
 
         try:
-            publish_round_data(
+            published = publish_round_data(
                 duel_id=duel_id, task_name=task.task_name,
                 tasks_root=config.tasks_root,
                 solution_labels={
@@ -3580,6 +3616,8 @@ def _solve_and_compare_round(
                     "challenger": solution_label,
                 },
             )
+            if published and on_artifacts_published is not None:
+                on_artifacts_published(task.task_name)
         except Exception:
             log.exception("R2 round publish failed (non-fatal)")
 
@@ -3752,6 +3790,9 @@ def _run_parallel_duel(
 
     rounds: list[ValidationRoundResult] = list(resume_rounds)
     completed_task_names = {round_result.task_name for round_result in rounds}
+    published_artifact_task_names: list[str] = []
+    published_artifact_task_set: set[str] = set()
+    progress_lock = threading.Lock()
     duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
     last_progress_at = time.monotonic()
     last_heartbeat_at = time.monotonic()
@@ -3786,7 +3827,8 @@ def _run_parallel_duel(
         try:
             on_round_complete(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                scored=scored, threshold=dyn_threshold, rounds=rounds,
+                scored=scored, threshold=dyn_threshold, rounds=list(rounds),
+                artifact_task_names=list(published_artifact_task_names),
                 phase="running_rounds",
                 gathered_tasks=len(tasks),
                 needed_tasks=n_rounds,
@@ -3796,6 +3838,13 @@ def _run_parallel_duel(
             log.exception("on_round_complete callback failed (non-fatal)")
 
     try:
+        def _note_artifacts_published(task_name: str) -> None:
+            with progress_lock:
+                if task_name not in published_artifact_task_set:
+                    published_artifact_task_set.add(task_name)
+                    published_artifact_task_names.append(task_name)
+            _emit_progress()
+
         task_queue = [task for task in tasks if task.task_name not in completed_task_names]
         futures: dict[Any, PoolTask] = {}
         pending: set[Any] = set()
@@ -3815,6 +3864,7 @@ def _run_parallel_duel(
                     config=config,
                     duel_id=duel_id,
                     pool=pool,
+                    on_artifacts_published=_note_artifacts_published,
                 )
                 futures[future] = task
                 pending.add(future)
@@ -4748,22 +4798,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
-                                    "rounds": [{"task_name": r.task_name, "winner": r.winner,
-                                                "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
-                                                "king_score": r.king_score,
-                                                "challenger_score": r.challenger_score,
-                                                "king_llm_score": r.king_llm_score,
-                                                "challenger_llm_score": r.challenger_llm_score,
-                                                "llm_judge_winner": r.llm_judge_winner,
-                                                "king_exit_reason": r.king_exit_reason,
-                                                "challenger_exit_reason": r.challenger_exit_reason,
-                                                "king_agent_timeout_seconds": r.king_agent_timeout_seconds,
-                                                "challenger_agent_timeout_seconds": r.challenger_agent_timeout_seconds,
-                                                "king_similarity_ratio": r.king_similarity_ratio,
-                                                "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                                                "king_challenger_similarity": r.king_challenger_similarity}
-                                               for r in rounds if r.scored],
+                                    "rounds": _active_rounds_payload(
+                                        rounds,
+                                        kw.get("artifact_task_names") if isinstance(kw.get("artifact_task_names"), list) else (),
+                                    ),
                                 }
+                                artifact_count = len(active_duel_info["rounds"])
+                                if artifact_count > scored:
+                                    active_duel_info["published_round_count"] = artifact_count
                                 for key in ("gathered_tasks", "needed_tasks", "pool_size", "pause_reason", "status_message"):
                                     if key in kw:
                                         active_duel_info[key] = kw[key]

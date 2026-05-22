@@ -22,6 +22,31 @@ class TaskPoolTest(unittest.TestCase):
         (task_dir / "commit.json").write_text("{}\n")
 
 
+    def test_active_rounds_payload_includes_published_unharvested_rounds(self):
+        scored = validate.ValidationRoundResult(
+            task_name="task-scored",
+            winner="king",
+            king_lines=3,
+            challenger_lines=1,
+            king_similarity_ratio=0.8,
+            challenger_similarity_ratio=0.4,
+            king_challenger_similarity=0.2,
+            task_root="/tmp/task-scored",
+            king_compare_root="",
+            challenger_compare_root="",
+        )
+
+        payload = validate._active_rounds_payload(
+            [scored],
+            ["task-scored", "task-published"],
+        )
+
+        self.assertEqual([item["task_name"] for item in payload], ["task-scored", "task-published"])
+        self.assertEqual(payload[0]["winner"], "king")
+        self.assertEqual(payload[1]["winner"], "pending")
+        self.assertTrue(payload[1]["artifact_published"])
+
+
     def test_provider_endpoint_round_error_is_unscored_task_error(self):
         task = PoolTask(
             task_name="task-provider-error",
@@ -147,11 +172,11 @@ class TaskPoolTest(unittest.TestCase):
         with validate._SAVED_TASK_FILL_LOCK:
             validate._SAVED_TASK_FILL_IN_FLIGHT.clear()
 
-    def test_pool_filler_worker_count_oversubscribes_solve_slots(self):
+    def test_pool_filler_worker_count_matches_solve_slots(self):
         config = RunConfig(validate_pool_filler_concurrency=25)
 
-        self.assertEqual(validate._pool_filler_worker_count(config), 75)
-        self.assertEqual(validate._pool_filler_executor_workers(config), 150)
+        self.assertEqual(validate._pool_filler_worker_count(config), 25)
+        self.assertEqual(validate._pool_filler_executor_workers(config), 50)
 
     def test_pool_solve_slot_uses_shared_semaphore(self):
         semaphore = threading.BoundedSemaphore(1)
