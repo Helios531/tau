@@ -15,6 +15,7 @@ import textwrap
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1993,6 +1994,12 @@ def _truncate_middle(text: str, max_chars: int) -> str:
 # Task pool
 # ---------------------------------------------------------------------------
 
+def _pool_task_has_baseline_artifacts(task: PoolTask) -> bool:
+    task_root = Path(task.task_root)
+    baseline_dir = task_root / "solutions" / "baseline"
+    return (baseline_dir / "solve.json").is_file() and (baseline_dir / "solution.diff").is_file()
+
+
 class TaskPool:
     """Thread-safe pool of pre-solved tasks shared across all duels.
 
@@ -2092,6 +2099,16 @@ class TaskPool:
         ``min_block`` is kept for call-site compatibility but no longer filters
         cached tasks; a restart should be able to use the persisted pool.
         """
+        tasks = self.take_many(min_block=min_block, limit=1, exclude=exclude)
+        return tasks[0] if tasks else None
+
+    def take_many(
+        self,
+        min_block: int,
+        limit: int,
+        exclude: set[str] | None = None,
+    ) -> list[PoolTask]:
+        """Return up to *limit* usable pool tasks without removing them."""
         excluded = exclude or set()
         with self._lock:
             candidates: list[PoolTask] = []
@@ -2102,21 +2119,14 @@ class TaskPool:
                     if task_name in excluded:
                         continue
                     task = PoolTask.from_dict(d)
-                    task_root = Path(task.task_root)
-                    baseline_dir = task_root / "solutions" / "baseline"
-                    if not (
-                        (baseline_dir / "solve.json").is_file()
-                        and (baseline_dir / "solution.diff").is_file()
-                    ):
+                    if not _pool_task_has_baseline_artifacts(task):
                         p.unlink(missing_ok=True)
                         continue
                     candidates.append(task)
                 except Exception:
                     p.unlink(missing_ok=True)
-            if candidates:
-                candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
-                return candidates[0]
-            return None
+            candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
+            return candidates[: max(0, int(limit))]
 
     # Keep pop() for backward compat (used by nothing now, but safe to have)
     def pop(self, min_block: int) -> PoolTask | None:
@@ -2449,6 +2459,21 @@ def _cached_solution_agent_timeout_seconds(
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
 
+_POOL_FILLER_WORKER_OVERSUBSCRIBE = 3
+
+
+def _pool_filler_worker_count(config: RunConfig) -> int:
+    return max(1, int(config.validate_pool_filler_concurrency)) * _POOL_FILLER_WORKER_OVERSUBSCRIBE
+
+
+def _pool_filler_executor_workers(config: RunConfig) -> int:
+    return _pool_filler_worker_count(config) * 2
+
+
+def _pool_solve_slot(pool_solve_semaphore: threading.Semaphore | None):
+    return pool_solve_semaphore if pool_solve_semaphore is not None else nullcontext()
+
+
 def _pool_filler_loop(
     config: RunConfig,
     state: ValidatorState,
@@ -2458,6 +2483,7 @@ def _pool_filler_loop(
     pool_starved: threading.Event | None = None,
     pool_refresh: TaskPoolRefreshBudget | None = None,
     pool_label: str = "primary",
+    pool_solve_semaphore: threading.Semaphore | None = None,
 ) -> None:
     while not stop_event.is_set():
         refresh_claimed = False
@@ -2567,11 +2593,12 @@ def _pool_filler_loop(
             if cached_baseline is None:
                 _remove_solution_artifacts(task_name=task_name, solution_name="baseline", config=config)
                 baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-                baseline_result = solve_task_run(
-                    task_name=task_name,
-                    solution_name="baseline",
-                    config=baseline_cfg,
-                )
+                with _pool_solve_slot(pool_solve_semaphore):
+                    baseline_result = solve_task_run(
+                        task_name=task_name,
+                        solution_name="baseline",
+                        config=baseline_cfg,
+                    )
                 baseline_exit_reason = baseline_result.exit_reason
                 baseline_elapsed = baseline_result.elapsed_seconds
             else:
@@ -2601,7 +2628,8 @@ def _pool_filler_loop(
             _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
             king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
             try:
-                king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
+                with _pool_solve_slot(pool_solve_semaphore):
+                    king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
             except Exception as exc:
                 log.info(
                     "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
@@ -3376,10 +3404,10 @@ def _gather_pool_tasks(
                 on_tick(gathered=len(tasks), needed=n)
             except Exception:
                 log.exception("gather on_tick callback failed (non-fatal)")
-        task = pool.take(min_block=min_block, exclude=seen)
-        if task is not None:
-            tasks.append(task)
-            seen.add(task.task_name)
+        batch = pool.take_many(min_block=min_block, limit=n - len(tasks), exclude=seen)
+        if batch:
+            tasks.extend(batch)
+            seen.update(task.task_name for task in batch)
             last_progress = time.monotonic()
         else:
             if pool_starved is not None:
@@ -3403,7 +3431,7 @@ def _gather_pool_tasks(
                 len(tasks), n, elapsed_no_progress, starve_grace,
             )
             break
-        if task is None:
+        if not batch:
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
@@ -4307,8 +4335,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.exception("Queue refresh dashboard publish failed (non-fatal)")
         return current_block
 
+    pool_solve_slots = threading.BoundedSemaphore(max(1, int(config.validate_pool_filler_concurrency)))
     pool_filler_executor = ThreadPoolExecutor(
-        max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
+        max_workers=_pool_filler_executor_workers(config),
     )
     previous_signal_handlers: dict[int, Any] = {}
 
@@ -4435,7 +4464,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 )
 
             # Start pool fillers
-            for _ in range(config.validate_pool_filler_concurrency):
+            for _ in range(_pool_filler_worker_count(config)):
                 pool_filler_executor.submit(
                     _pool_filler_loop,
                     config,
@@ -4446,6 +4475,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     pool_starved,
                     pool_refresh,
                     "primary",
+                    pool_solve_slots,
                 )
                 pool_filler_executor.submit(
                     _pool_filler_loop,
@@ -4457,6 +4487,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     retest_pool_starved,
                     retest_pool_refresh,
                     "retest",
+                    pool_solve_slots,
                 )
 
             while not shutdown_requested.is_set():

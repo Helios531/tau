@@ -147,6 +147,27 @@ class TaskPoolTest(unittest.TestCase):
         with validate._SAVED_TASK_FILL_LOCK:
             validate._SAVED_TASK_FILL_IN_FLIGHT.clear()
 
+    def test_pool_filler_worker_count_oversubscribes_solve_slots(self):
+        config = RunConfig(validate_pool_filler_concurrency=25)
+
+        self.assertEqual(validate._pool_filler_worker_count(config), 75)
+        self.assertEqual(validate._pool_filler_executor_workers(config), 150)
+
+    def test_pool_solve_slot_uses_shared_semaphore(self):
+        semaphore = threading.BoundedSemaphore(1)
+
+        with validate._pool_solve_slot(semaphore):
+            self.assertFalse(semaphore.acquire(blocking=False))
+
+        self.assertTrue(semaphore.acquire(blocking=False))
+        semaphore.release()
+
+    def test_pool_solve_slot_allows_noop_context(self):
+        with validate._pool_solve_slot(None):
+            entered = True
+
+        self.assertTrue(entered)
+
     def test_prepare_validate_paths_creates_primary_and_retest_pools(self):
         with tempfile.TemporaryDirectory() as td:
             paths = _prepare_validate_paths(Path(td))
