@@ -16,6 +16,8 @@ from validate import (
     _checkpoint_active_duel,
     _active_duel_dashboard_info_from_state,
     _build_recent_kings_for_r2_publish,
+    _king_emission_shares,
+    _maybe_set_weights,
     _publish_dashboard,
     _purge_stale_recent_kings_after_restart,
     _reconcile_dashboard_history_with_duels,
@@ -31,6 +33,49 @@ from validate import (
 
 
 class ValidatorStateRecoveryTest(unittest.TestCase):
+    def test_king_emission_distribution_is_current_40_prior_four_15_each(self):
+        self.assertEqual(_king_emission_shares(5), (0.40, 0.15, 0.15, 0.15, 0.15))
+        self.assertEqual(_king_emission_shares(3), (0.40, 0.15, 0.15))
+        self.assertEqual(_king_emission_shares(9), (0.40, 0.15, 0.15, 0.15, 0.15))
+
+    def test_set_weights_uses_weighted_king_distribution(self):
+        kings = [
+            _submission(hotkey=f"5King{i}", uid=i, commitment="unarbos/ninja@" + str(i) * 40, block=100 + i)
+            for i in range(1, 6)
+        ]
+        state = ValidatorState(current_king=kings[0], recent_kings=kings)
+        captured: dict[str, object] = {}
+
+        class _Neuron:
+            def __init__(self, uid: int):
+                self.uid = uid
+
+        class _Neurons:
+            def neurons_lite(self, _netuid):
+                return [_Neuron(uid) for uid in range(6)]
+
+        class _Subnets:
+            def get_uid_for_hotkey_on_subnet(self, hotkey, _netuid):
+                return int(hotkey.removeprefix("5King"))
+
+        class _Extrinsics:
+            def set_weights(self, **kwargs):
+                captured.update(kwargs)
+                return object()
+
+        class _Subtensor:
+            neurons = _Neurons()
+            subnets = _Subnets()
+            extrinsics = _Extrinsics()
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("validate.bt.Wallet", return_value=object()):
+            config = RunConfig(workspace_root=Path(tmp), validate_king_window_size=5)
+            _maybe_set_weights(subtensor=_Subtensor(), config=config, state=state, current_block=123, force=True)
+
+        self.assertEqual(captured["uids"], [0, 1, 2, 3, 4, 5])
+        self.assertEqual(captured["weights"], [0.0, 0.40, 0.15, 0.15, 0.15, 0.15])
+        self.assertEqual(state.last_weight_block, 123)
+
     def test_startup_purge_clears_recent_kings_when_current_king_missing(self):
         previous = _submission(
             hotkey="5PreviousKing",

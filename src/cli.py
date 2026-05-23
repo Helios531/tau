@@ -439,7 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep primary and retest pools as static fixed task sets for the current king; stale tasks are flushed instead of being refreshed in place.",
     )
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
-    validate.add_argument("--king-window-size", type=int, default=5, help="Number of recent kings to share emissions across (each gets 1/N).")
+    validate.add_argument("--king-window-size", type=int, default=5, help="Number of king emission slots; default distribution is 40% current king plus 15% for each prior king slot.")
     validate.add_argument("--poll-interval-seconds", type=int, default=600, help="Seconds between chain submission refreshes.")
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
     validate.add_argument("--max-duels", type=int, help="Stop after this many completed duels.")

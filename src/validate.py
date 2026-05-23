@@ -98,6 +98,19 @@ _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
 _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS = 300.0
+_KING_EMISSION_SHARES = (0.40, 0.15, 0.15, 0.15, 0.15)
+
+
+def _king_emission_shares(window: int) -> tuple[float, ...]:
+    slot_count = max(0, int(window))
+    return _KING_EMISSION_SHARES[:slot_count]
+
+
+def _king_emission_share_for_index(index: int, *, window: int) -> float:
+    shares = _king_emission_shares(window)
+    return shares[index] if 0 <= index < len(shares) else 0.0
+
+
 _DIFF_JUDGE_SEMAPHORE = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 _AGENT_CACHE_LOCK = threading.Lock()
 _POOL_GENERATION_BACKOFF_LOCK = threading.Lock()
@@ -4815,12 +4828,12 @@ def _publish_dashboard(
             _dashboard_submission_dict(
                 k,
                 history=history,
-                share=1.0 / max(1, config.validate_king_window_size),
+                share=_king_emission_share_for_index(i, window=config.validate_king_window_size),
                 king_since=_recent_king_since(k, state=state, history=history),
                 king_duels_defended=_recent_king_defense_count(k, history=history),
                 hold_seconds=_recent_king_hold_seconds(k, state=state, history=history),
             )
-            for k in _effective_recent_kings(state)
+            for i, k in enumerate(_effective_recent_kings(state))
         ],
         "chain_data": chain_data,
     }
@@ -6638,12 +6651,12 @@ def _resolve_promotion_candidate(*, subtensor, github_client, config, state, pri
 # ---------------------------------------------------------------------------
 
 def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool = False):
-    """Distribute weights across the last N kings (rolling window).
+    """Distribute weights across the current king and four prior kings.
 
-    Each window slot is worth 1/N of total emissions. Slots that are empty
-    (bootstrap) or point at a deregistered hotkey roll their share to the
-    burn UID. The same hotkey can occupy multiple slots if it reclaimed the
-    throne; shares accumulate.
+    The current king receives 40% of emissions; each of the next four rolling
+    king slots receives 15%. Empty or deregistered slots roll to the burn UID.
+    The same hotkey can occupy multiple slots if it reclaimed the throne;
+    shares accumulate.
     """
     if (
         not force
@@ -6657,13 +6670,12 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
         return
     uids = [int(n.uid) for n in neurons]
     uid_set = set(uids)
-    window = max(1, int(config.validate_king_window_size))
-    slot = 1.0 / window
+    shares = _king_emission_shares(config.validate_king_window_size)
     weights_by_uid: dict[int, float] = {u: 0.0 for u in uids}
     burn_share = 0.0
-    resolved: list[tuple[int, str]] = []
+    resolved: list[tuple[int, str, float]] = []
     recent = _effective_recent_kings(state)
-    for i in range(window):
+    for i, share in enumerate(shares):
         sub = recent[i] if i < len(recent) else None
         uid: int | None = None
         if (
@@ -6679,10 +6691,10 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
                 log.exception("uid lookup failed for %s", sub.hotkey)
                 uid = None
         if uid is not None and uid in uid_set:
-            weights_by_uid[uid] += slot
-            resolved.append((uid, sub.hotkey))
+            weights_by_uid[uid] += share
+            resolved.append((uid, sub.hotkey, share))
         else:
-            burn_share += slot
+            burn_share += share
     if burn_share > 0:
         if _BURN_KING_UID not in uid_set:
             log.error("Burn UID %s not in neurons; skipping set_weights", _BURN_KING_UID)
@@ -6712,8 +6724,8 @@ def _maybe_set_weights(*, subtensor, config, state, current_block, force: bool =
     if success:
         state.last_weight_block = current_block
     log.info(
-        "Set weights at block %s window=%d slot=%.4f burn=%.4f kings=%s response=%s",
-        current_block, window, slot, burn_share, resolved, resp,
+        "Set weights at block %s shares=%s burn=%.4f kings=%s response=%s",
+        current_block, shares, burn_share, resolved, resp,
     )
 
 
