@@ -29,6 +29,8 @@ _SAVED_TASK_FILL_LOCK = threading.Lock()
 _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
 _POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_FILLER_WORKER_OVERSUBSCRIBE = 3
+_ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_deleted"}
+_ARCHIVE_UPLOAD_RETRY_STATUSES = {"pool_inserted", "upload_failed"}
 
 
 @dataclass(slots=True)
@@ -270,6 +272,14 @@ def record_task_archive_status(
         return updated
 
 
+def archive_entry_upload_is_complete(entry: Any) -> bool:
+    return isinstance(entry, dict) and entry.get("status") in _ARCHIVE_UPLOAD_COMPLETE_STATUSES
+
+
+def archive_entry_hour(entry: Any) -> str:
+    return str(entry.get("archive_hour")) if isinstance(entry, dict) and entry.get("archive_hour") else archive_hour()
+
+
 def _file_artifact_record(path: Path, root: Path) -> dict[str, Any]:
     raw = path.read_bytes()
     common = {
@@ -386,53 +396,56 @@ def archive_pool_task_to_hf_jsonl(
     dataset_id = config.validate_task_archive_hf_dataset
     if not token or not dataset_id:
         return
-    existing = (load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}).get(task.task_name)
-    hour = str(existing.get("archive_hour")) if isinstance(existing, dict) and existing.get("archive_hour") else archive_hour()
-    hf_path = task_archive_jsonl_path(pool_label, hour)
-    record_task_archive_status(
-        config=config,
-        task_name=task.task_name,
-        pool_label=pool_label,
-        status="pool_inserted",
-        archive_hour_value=hour,
-        hf_path=hf_path,
-    )
-    try:
-        row = task_archive_jsonl_row(task=task, pool_label=pool_label, archive_hour_value=hour, king=king)
-        with _TASK_ARCHIVE_UPLOAD_LOCK:
-            upload_result = upload_jsonl(dataset_id=dataset_id, token=token, path_in_repo=hf_path, row=row)
-    except Exception as exc:
+    with _TASK_ARCHIVE_UPLOAD_LOCK:
+        existing = (load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}).get(task.task_name)
+        if archive_entry_upload_is_complete(existing):
+            pool.remove(task.task_name)
+            return
+        hour = archive_entry_hour(existing)
+        hf_path = task_archive_jsonl_path(pool_label, hour)
         record_task_archive_status(
             config=config,
             task_name=task.task_name,
             pool_label=pool_label,
-            status="upload_failed",
+            status="pool_inserted",
             archive_hour_value=hour,
             hf_path=hf_path,
-            error=str(exc),
         )
-        log.exception("Task archive[%s]: HF upload failed for %s", pool_label, task.task_name)
-        return
+        try:
+            row = task_archive_jsonl_row(task=task, pool_label=pool_label, archive_hour_value=hour, king=king)
+            upload_result = upload_jsonl(dataset_id=dataset_id, token=token, path_in_repo=hf_path, row=row)
+        except Exception as exc:
+            record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label=pool_label,
+                status="upload_failed",
+                archive_hour_value=hour,
+                hf_path=hf_path,
+                error=str(exc),
+            )
+            log.exception("Task archive[%s]: HF upload failed for %s", pool_label, task.task_name)
+            return
 
-    upload_url = getattr(upload_result, "commit_url", None) or str(upload_result or "")
-    pool.remove(task.task_name)
-    record_task_archive_status(
-        config=config,
-        task_name=task.task_name,
-        pool_label=pool_label,
-        status="uploaded_delete_pending",
-        archive_hour_value=hour,
-        hf_path=hf_path,
-    )
-    lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
-    log.info(
-        "Task archive[%s]: uploaded %s to %s (%s); removed from pool and deferred local delete%s",
-        pool_label,
-        task.task_name,
-        hf_path,
-        upload_url,
-        lease_note,
-    )
+        upload_url = getattr(upload_result, "commit_url", None) or str(upload_result or "")
+        pool.remove(task.task_name)
+        record_task_archive_status(
+            config=config,
+            task_name=task.task_name,
+            pool_label=pool_label,
+            status="uploaded_delete_pending",
+            archive_hour_value=hour,
+            hf_path=hf_path,
+        )
+        lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
+        log.info(
+            "Task archive[%s]: uploaded %s to %s (%s); removed from pool and deferred local delete%s",
+            pool_label,
+            task.task_name,
+            hf_path,
+            upload_url,
+            lease_note,
+        )
 
 
 def active_duel_task_names(config: RunConfig) -> set[str]:
@@ -489,7 +502,7 @@ def retry_failed_task_uploads(
     entries = [
         (str(task_name), entry)
         for task_name, entry in (ledger.get("tasks") or {}).items()
-        if isinstance(entry, dict) and entry.get("status") == "upload_failed"
+        if isinstance(entry, dict) and entry.get("status") in _ARCHIVE_UPLOAD_RETRY_STATUSES
     ]
     retried = 0
     leased_names = active_duel_task_names(config)

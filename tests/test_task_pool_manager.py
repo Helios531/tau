@@ -593,6 +593,76 @@ class TaskPoolManagerTest(unittest.TestCase):
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_deleted")
 
+    def test_retry_pool_inserted_task_upload_completes_archive(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="primary",
+                status="pool_inserted",
+                archive_hour_value="2026-05-22-01",
+                hf_path="tasks/primary/2026-05-22-01.jsonl",
+            )
+            uploaded = []
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                retried = manager.retry_failed_task_uploads(
+                    config=config,
+                    pools_by_label={"primary": pool},
+                    king=None,
+                    upload_jsonl=lambda **kwargs: uploaded.append(kwargs) or "ok",
+                )
+
+            self.assertEqual(retried, 1)
+            self.assertEqual(pool.size(), 0)
+            self.assertEqual(uploaded[0]["path_in_repo"], "tasks/primary/2026-05-22-01.jsonl")
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
+
+    def test_archive_upload_skips_task_already_uploaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="primary",
+                status="uploaded_delete_pending",
+                archive_hour_value="2026-05-22-01",
+                hf_path="tasks/primary/2026-05-22-01.jsonl",
+            )
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                manager.archive_pool_task_to_hf_jsonl(
+                    config=config,
+                    pool=pool,
+                    task=task,
+                    pool_label="primary",
+                    king=None,
+                    leased_task_names=set(),
+                    upload_jsonl=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate upload")),
+                )
+
+            self.assertEqual(pool.size(), 0)
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            entry = ledger["tasks"][task.task_name]
+            self.assertEqual(entry["status"], "uploaded_delete_pending")
+            self.assertEqual(entry["archive_hour"], "2026-05-22-01")
+
     def test_archive_upload_defers_delete_when_task_is_leased_during_upload(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(
